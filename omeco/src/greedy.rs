@@ -402,73 +402,60 @@ fn build_nested_with_level<L: Label>(
     openedges: &[L],
     level: usize,
 ) -> NestedEinsum<L> {
-    match tree {
-        ContractionTree::Leaf(idx) => NestedEinsum::leaf(*idx),
-        ContractionTree::Node { left, right } => {
-            // Get labels from children
-            let left_labels = get_subtree_labels(left, leaf_labels, incidence_list);
-            let right_labels = get_subtree_labels(right, leaf_labels, incidence_list);
-
-            // At level 0 (root), use openedges; otherwise compute intermediate output
-            let output_labels = if level == 0 {
-                openedges.to_vec()
-            } else {
-                let left_vertices = get_subtree_vertices(left);
-                let right_vertices = get_subtree_vertices(right);
-                compute_contraction_output_with_hypergraph(
-                    &left_labels,
-                    &right_labels,
-                    incidence_list,
-                    &left_vertices,
-                    &right_vertices,
-                )
-            };
-
-            // Build children recursively with incremented level
-            let left_nested =
-                build_nested_with_level(left, leaf_labels, incidence_list, openedges, level + 1);
-            let right_nested =
-                build_nested_with_level(right, leaf_labels, incidence_list, openedges, level + 1);
-
-            // Create the einsum code for this contraction
-            let eins = EinCode::new(vec![left_labels, right_labels], output_labels);
-
-            NestedEinsum::node(vec![left_nested, right_nested], eins)
-        }
-    }
+    build_nested_memo(tree, leaf_labels, incidence_list, openedges, level).0
 }
 
-fn get_subtree_labels<L: Label>(
+/// Bottom-up build that returns `(nested, subtree_output_labels, subtree_vertices)`.
+///
+/// The previous version called `get_subtree_labels`/`get_subtree_vertices` at
+/// every node, each a full recursive subtree walk, so building the tree was
+/// O(n^2) (O(n^2 * |labels|) in practice) — dominant on large/deep trees
+/// (observed: a single tree of ~9000 leaves took >700 s). Threading the subtree
+/// labels and vertices up through the recursion computes each exactly once,
+/// making it O(n). Semantically identical: `subtree_output_labels` equals what
+/// `get_subtree_labels` returned (`compute_contraction_output_with_hypergraph`
+/// for a node, leaf labels for a leaf), and the root still uses `openedges`.
+fn build_nested_memo<L: Label>(
     tree: &ContractionTree,
     leaf_labels: &HashMap<usize, Vec<L>>,
     incidence_list: &IncidenceList<usize, L>,
-) -> Vec<L> {
+    openedges: &[L],
+    level: usize,
+) -> (NestedEinsum<L>, Vec<L>, Vec<usize>) {
     match tree {
-        ContractionTree::Leaf(idx) => leaf_labels.get(idx).cloned().unwrap_or_default(),
+        ContractionTree::Leaf(idx) => {
+            let labels = leaf_labels.get(idx).cloned().unwrap_or_default();
+            (NestedEinsum::leaf(*idx), labels, vec![*idx])
+        }
         ContractionTree::Node { left, right } => {
-            let left_labels = get_subtree_labels(left, leaf_labels, incidence_list);
-            let right_labels = get_subtree_labels(right, leaf_labels, incidence_list);
-            let left_vertices = get_subtree_vertices(left);
-            let right_vertices = get_subtree_vertices(right);
-            compute_contraction_output_with_hypergraph(
+            let (left_nested, left_labels, left_vertices) =
+                build_nested_memo(left, leaf_labels, incidence_list, openedges, level + 1);
+            let (right_nested, right_labels, right_vertices) =
+                build_nested_memo(right, leaf_labels, incidence_list, openedges, level + 1);
+
+            // The labels this subtree exposes to its parent (independent of the
+            // root's openedges) — matches `get_subtree_labels` for a Node.
+            let contracted = compute_contraction_output_with_hypergraph(
                 &left_labels,
                 &right_labels,
                 incidence_list,
                 &left_vertices,
                 &right_vertices,
-            )
-        }
-    }
-}
+            );
+            // At the root use the requested open edges; otherwise the contracted
+            // intermediate output.
+            let output_labels = if level == 0 {
+                openedges.to_vec()
+            } else {
+                contracted.clone()
+            };
 
-/// Get all leaf vertex IDs from a subtree.
-fn get_subtree_vertices(tree: &ContractionTree) -> Vec<usize> {
-    match tree {
-        ContractionTree::Leaf(idx) => vec![*idx],
-        ContractionTree::Node { left, right } => {
-            let mut vertices = get_subtree_vertices(left);
-            vertices.extend(get_subtree_vertices(right));
-            vertices
+            let mut my_vertices = left_vertices;
+            my_vertices.extend(right_vertices);
+
+            let eins = EinCode::new(vec![left_labels, right_labels], output_labels);
+            let ne = NestedEinsum::node(vec![left_nested, right_nested], eins);
+            (ne, contracted, my_vertices)
         }
     }
 }
