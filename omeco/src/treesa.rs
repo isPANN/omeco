@@ -648,6 +648,80 @@ pub fn optimize_treesa<L: Label>(
     ))
 }
 
+/// Warm-start TreeSA: re-thermalize an existing contraction order instead of
+/// initializing from scratch.
+///
+/// This is the faithful port of OMEinsumContractionOrders' `optimize_code(code,
+/// size_dict, TreeSA(initializer = :specified, ...))` (Julia's `rethermalize`):
+/// every trial begins from `seed` and the β schedule only locally anneals it, so
+/// a good seed (e.g. an order adapted from a parent contraction) is preserved and
+/// merely refined rather than discarded. `optimize_treesa`, by contrast, rebuilds
+/// the tree with a greedy/random initializer and ignores any incoming order.
+///
+/// `code` is the flat einsum whose `ixs`/`iy` provide the labels; `seed`'s leaf
+/// `tensor_index` values must index into `code.ixs` (i.e. pass the *original*
+/// `EinCode`, not a leaf-permuted flattening). The returned tree's leaves index
+/// into `code.ixs` as well, so no caller-side remapping is needed.
+pub fn optimize_treesa_warm<L: Label>(
+    seed: &NestedEinsum<L>,
+    code: &EinCode<L>,
+    size_dict: &HashMap<L, usize>,
+    config: &TreeSA,
+) -> Option<NestedEinsum<L>> {
+    if code.num_tensors() == 0 {
+        return None;
+    }
+    if code.num_tensors() == 1 {
+        return Some(NestedEinsum::leaf(0));
+    }
+
+    // Build label mapping (identical to `optimize_treesa`).
+    let (label_map, labels) = build_label_map(code);
+    let nedge = labels.len();
+    let log2_sizes: Vec<f64> = labels
+        .iter()
+        .map(|l| (size_dict[l] as f64).log2())
+        .collect();
+    let int_ixs = convert_to_int_indices(&code.ixs, &label_map);
+    let int_iy: Vec<usize> = code.iy.iter().map(|l| label_map[l]).collect();
+
+    // Convert the seed order into the internal ExprTree once; every trial clones
+    // it as its starting point (matches `:specified` initialization).
+    let seed_tree = nested_to_expr_tree(seed, &int_ixs, &int_iy, &label_map)?;
+
+    // Run parallel trials, each annealing a clone of the seed with its own RNG.
+    let results: Vec<_> = (0..config.ntrials)
+        .into_par_iter()
+        .map(|trial_idx| {
+            use rand::SeedableRng;
+            let mut rng = rand::rngs::SmallRng::seed_from_u64(trial_idx as u64 + 42);
+
+            let optimized = optimize_tree_sa(
+                seed_tree.clone(),
+                &log2_sizes,
+                &config.betas,
+                config.niters,
+                &config.score,
+                config.decomposition_type,
+                &mut rng,
+                nedge,
+            );
+
+            let (tc, sc, rw) = tree_complexity(&optimized, &log2_sizes);
+            let score = config.score.evaluate(tc, sc, rw);
+            (optimized, score, tc, sc, rw)
+        })
+        .collect();
+
+    let (best_tree, _, _, _, _) = results
+        .into_iter()
+        .min_by(|(_, s1, _, _, _), (_, s2, _, _, _)| s1.partial_cmp(s2).unwrap())?;
+
+    Some(expr_tree_to_nested(
+        &best_tree, &code.ixs, &labels, &code.iy, 0,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -714,6 +788,74 @@ mod tests {
 
         let tree = init_random(&int_ixs, &int_iy, nedge, DecompositionType::Tree, &mut rng);
         assert_eq!(tree.leaf_count(), 3);
+    }
+
+    /// Build the chain i-j-k-l (leaf0=[i,j], leaf1=[j,k], leaf2=[k,l], iy=[i,l])
+    /// with a deliberately BAD seed order ((leaf0,leaf2),leaf1): pairing leaf0 and
+    /// leaf2 first forms the outer product [i,j,k,l] (sc=4), worse than the chain
+    /// order (sc=2). Used to prove warm-start starts from the given seed.
+    fn chain_code_and_bad_seed() -> (EinCode<char>, NestedEinsum<char>, HashMap<char, usize>) {
+        let code = EinCode::new(
+            vec![vec!['i', 'j'], vec!['j', 'k'], vec!['k', 'l']],
+            vec!['i', 'l'],
+        );
+        let size_dict: HashMap<char, usize> = [('i', 2), ('j', 2), ('k', 2), ('l', 2)]
+            .into_iter()
+            .collect();
+        let node_a = NestedEinsum::node(
+            vec![NestedEinsum::leaf(0), NestedEinsum::leaf(2)],
+            EinCode::new(
+                vec![vec!['i', 'j'], vec!['k', 'l']],
+                vec!['i', 'j', 'k', 'l'],
+            ),
+        );
+        let seed = NestedEinsum::node(
+            vec![node_a, NestedEinsum::leaf(1)],
+            EinCode::new(
+                vec![vec!['i', 'j', 'k', 'l'], vec!['j', 'k']],
+                vec!['i', 'l'],
+            ),
+        );
+        (code, seed, size_dict)
+    }
+
+    /// Warm-start defining property: with NO annealing (empty β schedule), the
+    /// optimizer must return the SEED's structure unchanged. A cold greedy/random
+    /// init would discard the seed and never reproduce the outer-product-first
+    /// order, so leaf order [0,2,1] proves the seed is the starting tree.
+    #[test]
+    fn test_optimize_treesa_warm_zero_anneal_preserves_seed() {
+        let (code, seed, size_dict) = chain_code_and_bad_seed();
+        assert_eq!(seed.leaf_indices(), vec![0, 2, 1]);
+
+        let config = TreeSA::new(vec![], 1, 0, Initializer::Greedy, ScoreFunction::default());
+        let warm = optimize_treesa_warm(&seed, &code, &size_dict, &config).unwrap();
+
+        assert!(warm.is_binary());
+        assert_eq!(
+            warm.leaf_indices(),
+            vec![0, 2, 1],
+            "warm-start with no annealing must preserve the seed order"
+        );
+    }
+
+    /// With a real β schedule, warm-start re-thermalizes the bad seed and should
+    /// not return something worse than the seed (the whole point of refining).
+    #[test]
+    fn test_optimize_treesa_warm_improves_bad_seed() {
+        use crate::contraction_complexity;
+        let (code, seed, size_dict) = chain_code_and_bad_seed();
+        let seed_sc = contraction_complexity(&seed, &size_dict, &code.ixs).sc;
+
+        let betas: Vec<f64> = (0..15).map(|i| 1.0 + i as f64).collect();
+        let config = TreeSA::new(betas, 3, 30, Initializer::Greedy, ScoreFunction::default());
+        let warm = optimize_treesa_warm(&seed, &code, &size_dict, &config).unwrap();
+
+        let warm_sc = contraction_complexity(&warm, &size_dict, &code.ixs).sc;
+        assert!(
+            warm_sc <= seed_sc,
+            "warm-start should not worsen the seed (seed_sc={seed_sc}, warm_sc={warm_sc})"
+        );
     }
 
     #[test]

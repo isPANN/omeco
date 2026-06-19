@@ -151,7 +151,7 @@ pub use greedy::{optimize_greedy, ContractionTree, GreedyMethod, GreedyResult};
 pub use label::Label;
 pub use score::ScoreFunction;
 pub use slicer::{slice_code, CodeSlicer, Slicer, TreeSASlicer};
-pub use treesa::{optimize_treesa, Initializer, TreeSA};
+pub use treesa::{optimize_treesa, optimize_treesa_warm, Initializer, TreeSA};
 
 use std::collections::HashMap;
 
