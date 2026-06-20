@@ -336,18 +336,25 @@ fn peak_device_inner<L: Label>(
         NestedEinsum::Node { args, eins } => {
             let mut max_peak = 0;
             let mut current_temp = temp_size;
+            let mut operand_sum = 0;
 
             for arg in args {
                 let (peak, arg_size) =
                     peak_device_inner(arg, size_dict, original_ixs, current_temp);
                 max_peak = max_peak.max(peak);
                 current_temp += arg_size;
+                operand_sum += arg_size;
             }
 
-            // Live set (held + operands + output) PLUS the output-permute
-            // transient: the GEMM result and its permuted copy coexist (+output).
+            // Conservative concurrent device footprint while THIS node contracts:
+            // resident ancestors (temp_size, 1x) plus this node's operands and
+            // output each duplicated by a transient — operand canonicalization
+            // gathers and the output-permutation buffer (omeinsum CUDA path) —
+            // i.e. temp_size + 2*(operands + output). A provable upper bound on
+            // actual VRAM (no allocator pool, so high-water = max over nodes of
+            // this) that also matches the measured ~2x-live-set high-water.
             let output_size = tensor_size(&eins.iy, size_dict);
-            max_peak = max_peak.max(current_temp + 2 * output_size);
+            max_peak = max_peak.max(temp_size + 2 * (operand_sum + output_size));
 
             (max_peak, output_size)
         }
@@ -536,13 +543,15 @@ mod tests {
     }
 
     #[test]
-    fn test_peak_device_size_adds_output_permute_transient() {
+    fn test_peak_device_size_doubles_operands_and_output_transients() {
         // Single binary node A[i,j] x B[j,k] -> C[i,k]; i=4,j=8,k=4.
         // Tensor sizes: A=32, B=32, C=16.
         // peak_memory (logical live set: held + operands + output) = 64 + 16 = 80.
-        // peak_device_size additionally counts the output-permutation buffer that
-        // coexists with the GEMM result on the GPU backend (omeinsum device_gather
-        // on the output): + one more output -> 64 + 2*16 = 96.
+        // On the GPU backend each operand is duplicated by a canonicalization
+        // gather and the output by a permute buffer (omeinsum cuda path), so the
+        // worst-case concurrent device footprint is 2*(A+B+C) for a root node
+        // with no resident ancestors: 2*(32+32+16) = 160. Validated against
+        // measured VRAM high-water (~2x the live set on n80).
         let leaf0 = NestedEinsum::leaf(0);
         let leaf1 = NestedEinsum::leaf(1);
         let eins = EinCode::new(vec![vec!['i', 'j'], vec!['j', 'k']], vec!['i', 'k']);
@@ -557,7 +566,7 @@ mod tests {
         let live = peak_memory(&nested, &size_dict, &original_ixs);
         let dev = peak_device_size(&nested, &size_dict, &original_ixs);
         assert_eq!(live, 80, "logical live-set peak");
-        assert_eq!(dev, 96, "device peak = live set + output-permute transient");
+        assert_eq!(dev, 160, "device peak = 2*(operands + output) transients");
         assert!(dev > live);
     }
 
