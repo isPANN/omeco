@@ -290,6 +290,70 @@ fn peak_memory_inner<L: Label>(
     }
 }
 
+/// Peak concurrent **device** memory for a NestedEinsum, in number of elements.
+///
+/// Where [`peak_memory`] returns the logical live set (held intermediates + the
+/// two operands + the output at each node), this models the *transient* buffer
+/// the GPU backend additionally holds while contracting a node: the
+/// output-permutation buffer that coexists with the freshly written GEMM result
+/// (omeinsum `device_gather` on the output — the GEMM `C` and its permuted copy
+/// are alive simultaneously). That extra `+output` per node is the dominant part
+/// of the gap between [`peak_memory`] and observed VRAM high-water; operand
+/// gathers are normally elided by the identity-gather fast path. Because
+/// omeinsum's CUDA backend uses plain `cudaMalloc`/`cudaFree` (no pool), VRAM
+/// high-water equals the max over nodes of this per-node concurrent footprint —
+/// so this function is exactly the quantity a memory-budget slicer must bound.
+/// Pure tree arithmetic: deterministic, independent of any RNG-seeded search.
+///
+/// NOTE: the operand-gather term is not yet modeled; this is validated against
+/// measured GPU high-water before being used as a hard budget (see the
+/// device-bytes validation task).
+pub fn peak_device_size<L: Label>(
+    code: &NestedEinsum<L>,
+    size_dict: &HashMap<L, usize>,
+    original_ixs: &[Vec<L>],
+) -> usize {
+    peak_device_inner(code, size_dict, original_ixs, 0).0
+}
+
+fn peak_device_inner<L: Label>(
+    code: &NestedEinsum<L>,
+    size_dict: &HashMap<L, usize>,
+    original_ixs: &[Vec<L>],
+    temp_size: usize,
+) -> (usize, usize) {
+    match code {
+        NestedEinsum::Leaf { tensor_index } => {
+            let size = tensor_size(
+                original_ixs
+                    .get(*tensor_index)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]),
+                size_dict,
+            );
+            (size + temp_size, size)
+        }
+        NestedEinsum::Node { args, eins } => {
+            let mut max_peak = 0;
+            let mut current_temp = temp_size;
+
+            for arg in args {
+                let (peak, arg_size) =
+                    peak_device_inner(arg, size_dict, original_ixs, current_temp);
+                max_peak = max_peak.max(peak);
+                current_temp += arg_size;
+            }
+
+            // Live set (held + operands + output) PLUS the output-permute
+            // transient: the GEMM result and its permuted copy coexist (+output).
+            let output_size = tensor_size(&eins.iy, size_dict);
+            max_peak = max_peak.max(current_temp + 2 * output_size);
+
+            (max_peak, output_size)
+        }
+    }
+}
+
 fn tensor_size<L: Label>(labels: &[L], size_dict: &HashMap<L, usize>) -> usize {
     if labels.is_empty() {
         1
@@ -469,6 +533,45 @@ mod tests {
         // Peak = max(input1 + temp, input2 + input1 + temp, output + input1 + input2)
         // = max(32, 32+32, 16+32+32) = 80
         assert!(peak > 0);
+    }
+
+    #[test]
+    fn test_peak_device_size_adds_output_permute_transient() {
+        // Single binary node A[i,j] x B[j,k] -> C[i,k]; i=4,j=8,k=4.
+        // Tensor sizes: A=32, B=32, C=16.
+        // peak_memory (logical live set: held + operands + output) = 64 + 16 = 80.
+        // peak_device_size additionally counts the output-permutation buffer that
+        // coexists with the GEMM result on the GPU backend (omeinsum device_gather
+        // on the output): + one more output -> 64 + 2*16 = 96.
+        let leaf0 = NestedEinsum::leaf(0);
+        let leaf1 = NestedEinsum::leaf(1);
+        let eins = EinCode::new(vec![vec!['i', 'j'], vec!['j', 'k']], vec!['i', 'k']);
+        let nested = NestedEinsum::node(vec![leaf0, leaf1], eins);
+
+        let original_ixs = vec![vec!['i', 'j'], vec!['j', 'k']];
+        let mut size_dict = HashMap::new();
+        size_dict.insert('i', 4);
+        size_dict.insert('j', 8);
+        size_dict.insert('k', 4);
+
+        let live = peak_memory(&nested, &size_dict, &original_ixs);
+        let dev = peak_device_size(&nested, &size_dict, &original_ixs);
+        assert_eq!(live, 80, "logical live-set peak");
+        assert_eq!(dev, 96, "device peak = live set + output-permute transient");
+        assert!(dev > live);
+    }
+
+    #[test]
+    fn test_peak_device_size_leaf_has_no_transient() {
+        // A lone leaf is never contracted, so there is no GEMM/permute buffer:
+        // device peak equals the tensor size, same as peak_memory.
+        let leaf = NestedEinsum::leaf(0);
+        let original_ixs = vec![vec!['i', 'j']];
+        let mut size_dict = HashMap::new();
+        size_dict.insert('i', 4);
+        size_dict.insert('j', 8);
+
+        assert_eq!(peak_device_size(&leaf, &size_dict, &original_ixs), 32);
     }
 
     #[test]
