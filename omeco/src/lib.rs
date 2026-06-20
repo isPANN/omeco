@@ -144,7 +144,7 @@ pub mod test_utils;
 // Re-export main types
 pub use complexity::{
     eincode_complexity, flop, nested_complexity, nested_flop, peak_device_size, peak_memory,
-    sliced_complexity, ContractionComplexity,
+    reorder_for_peak_size, sliced_complexity, ContractionComplexity,
 };
 pub use eincode::{log2_size_dict, uniform_size_dict, EinCode, NestedEinsum, SlicedEinsum};
 pub use greedy::{optimize_greedy, ContractionTree, GreedyMethod, GreedyResult};

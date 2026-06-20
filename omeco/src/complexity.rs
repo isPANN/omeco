@@ -361,6 +361,69 @@ fn peak_device_inner<L: Label>(
     }
 }
 
+/// Deterministically reorder a contraction tree's traversal to minimize its
+/// [`peak_device_size`], without changing the contracted value.
+///
+/// The contracted result is invariant under swapping a node's argument order
+/// (and its matching input-label order), but the *peak* is not: the argument
+/// visited second is computed against a baseline raised by the first argument's
+/// resident output. The peak-minimizing order is the classic pebbling /
+/// Sethi-Ullman rule — visit arguments in descending order of
+/// `(subtree peak − subtree output)`, so the argument that needs the most
+/// scratch runs while the baseline is lowest. Children are reordered bottom-up.
+/// Pure function of the tree: no RNG, fully deterministic.
+pub fn reorder_for_peak_size<L: Label>(
+    code: &NestedEinsum<L>,
+    size_dict: &HashMap<L, usize>,
+    original_ixs: &[Vec<L>],
+) -> NestedEinsum<L> {
+    match code {
+        NestedEinsum::Leaf { tensor_index } => NestedEinsum::leaf(*tensor_index),
+        NestedEinsum::Node { args, eins } => {
+            // Reorder each child first (bottom-up).
+            let children: Vec<NestedEinsum<L>> = args
+                .iter()
+                .map(|a| reorder_for_peak_size(a, size_dict, original_ixs))
+                .collect();
+
+            // Rank by (peak - output) descending; stable so ties keep input
+            // order (determinism). i128 keeps the difference signed and exact.
+            let mut order: Vec<usize> = (0..children.len()).collect();
+            let key = |c: &NestedEinsum<L>| -> i128 {
+                let peak = peak_device_size(c, size_dict, original_ixs) as i128;
+                let out = output_elems(c, size_dict, original_ixs) as i128;
+                peak - out
+            };
+            let keys: Vec<i128> = children.iter().map(key).collect();
+            order.sort_by(|&i, &j| keys[j].cmp(&keys[i]));
+
+            // Permute arguments and the EinCode's input labels in tandem so each
+            // argument stays paired with its index list.
+            let new_args: Vec<NestedEinsum<L>> = order.iter().map(|&i| children[i].clone()).collect();
+            let new_ixs: Vec<Vec<L>> = order.iter().map(|&i| eins.ixs[i].clone()).collect();
+            NestedEinsum::node(new_args, EinCode::new(new_ixs, eins.iy.clone()))
+        }
+    }
+}
+
+/// Element count of a subtree's output tensor (leaf tensor or node `iy`).
+fn output_elems<L: Label>(
+    code: &NestedEinsum<L>,
+    size_dict: &HashMap<L, usize>,
+    original_ixs: &[Vec<L>],
+) -> usize {
+    match code {
+        NestedEinsum::Leaf { tensor_index } => tensor_size(
+            original_ixs
+                .get(*tensor_index)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]),
+            size_dict,
+        ),
+        NestedEinsum::Node { eins, .. } => tensor_size(&eins.iy, size_dict),
+    }
+}
+
 fn tensor_size<L: Label>(labels: &[L], size_dict: &HashMap<L, usize>) -> usize {
     if labels.is_empty() {
         1
@@ -568,6 +631,57 @@ mod tests {
         assert_eq!(live, 80, "logical live-set peak");
         assert_eq!(dev, 160, "device peak = 2*(operands + output) transients");
         assert!(dev > live);
+    }
+
+    #[test]
+    fn test_reorder_for_peak_size_lowers_peak_value_preserving() {
+        // N contracts leaf0[a] with B, where B = leaf1[b,c] x leaf2[b,c] -> scalar.
+        // B has a large internal device peak (258) but a tiny output (1); leaf0's
+        // peak is 64. Visiting B second (natural [leaf0, B]) raises B's baseline
+        // by leaf0's output -> root peak 322. Visiting the larger-(peak-output)
+        // child B first -> 258.
+        let leaf0 = NestedEinsum::leaf(0);
+        let leaf1 = NestedEinsum::leaf(1);
+        let leaf2 = NestedEinsum::leaf(2);
+        let b = NestedEinsum::node(
+            vec![leaf1, leaf2],
+            EinCode::new(vec![vec!['b', 'c'], vec!['b', 'c']], vec![]),
+        );
+        let n = NestedEinsum::node(
+            vec![leaf0, b],
+            EinCode::new(vec![vec!['a'], vec![]], vec!['a']),
+        );
+
+        let original_ixs = vec![vec!['a'], vec!['b', 'c'], vec!['b', 'c']];
+        let mut size_dict = HashMap::new();
+        size_dict.insert('a', 64);
+        size_dict.insert('b', 8);
+        size_dict.insert('c', 8);
+
+        let before = peak_device_size(&n, &size_dict, &original_ixs);
+        let reordered = reorder_for_peak_size(&n, &size_dict, &original_ixs);
+        let after = peak_device_size(&reordered, &size_dict, &original_ixs);
+
+        assert_eq!(before, 322, "natural-order device peak");
+        assert_eq!(after, 258, "reordered device peak");
+        assert!(after < before);
+
+        // Value-preserving: same contraction complexity (tc/sc) and same leaf set.
+        let cb = nested_complexity(&n, &size_dict, &original_ixs);
+        let ca = nested_complexity(&reordered, &size_dict, &original_ixs);
+        assert!((cb.tc - ca.tc).abs() < 1e-9 && (cb.sc - ca.sc).abs() < 1e-9);
+        fn leaves(c: &NestedEinsum<char>, out: &mut Vec<usize>) {
+            match c {
+                NestedEinsum::Leaf { tensor_index } => out.push(*tensor_index),
+                NestedEinsum::Node { args, .. } => args.iter().for_each(|a| leaves(a, out)),
+            }
+        }
+        let (mut lb, mut la) = (Vec::new(), Vec::new());
+        leaves(&n, &mut lb);
+        leaves(&reordered, &mut la);
+        lb.sort();
+        la.sort();
+        assert_eq!(lb, la, "reorder preserves the leaf set");
     }
 
     #[test]
